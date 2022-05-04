@@ -26,6 +26,7 @@
 #include <ns3/vector.h>
 #include <ns3/random-variable-stream.h>
 #include <cmath>
+#include <numbers>
 
 #define EXPERIMENT_NAME "Experimento_ADR"
 #define PROTOCOLO_AODV 1
@@ -37,6 +38,19 @@
 #define DEFAULT_DISTANCIA_MINIMA_ENTRE_NAVIOS 5.0 // km
 #define DEFAULT_COMPRIMENTO_ROTA 60.0 // km
 #define UDP_SERVER_PORT 300
+// Constantes das funcoes densidade de probabilidade
+#define FDP_A_ROTA_OESTE 0.292064
+#define FDP_B_ROTA_OESTE 0.998286
+#define FDP_C_ROTA_OESTE 4.763146
+#define FDP_MU_ROTA_OESTE 10.383780
+#define FDP_SIGMA_ROTA_OESTE 5.488477
+#define FDP_A_ROTA_LESTE 0.284495
+#define FDP_B_ROTA_LESTE 0.998324
+#define FDP_C_ROTA_LESTE 4.354804
+#define FDP_MU_ROTA_LESTE 10.800865
+#define FDP_SIGMA_ROTA_LESTE 5.189037
+#define MATH_PI 3.141592
+#define VELOCIDADE_MAX_NAVIO 27.6874 // km por segundo de simulacao
 
 using namespace ns3;
 
@@ -69,6 +83,10 @@ private:
 	Ipv4AddressHelper m_ipv4AdressHelper;
 	Ipv4InterfaceContainer m_ipInterfaceContainerEstacaoTerrestre;
 	InternetStackHelper m_internetHelper;
+	EmpiricalRandomVariable m_variavelTempoEntreNaviosLeste;
+	EmpiricalRandomVariable m_variavelVelocidadeNaviosLeste;
+	EmpiricalRandomVariable m_variavelTempoEntreNaviosOeste;
+	EmpiricalRandomVariable m_variavelVelocidadeNaviosOeste;
 	// Controle para nao inserir um navio em cima de outro
 	double m_ultimoNavioRotaLesteY;
 	double m_ultimoNavioRotaOesteY;
@@ -81,6 +99,11 @@ private:
 	void InserirNavioNaRota(RotaDirecao rota, double velocidade);
 	Ptr<WimaxChannel> CriaWimaxChannel();
 	double CalculaYNovoNavio(RotaDirecao rota);
+	void ConfigurarDistribuicoes();
+	void ConfigurarVariavelTempoNavios();
+	void ConfigurarVariavelVelocidadeNavios();
+	double FdpTempoNavios(double x, RotaDirecao rota);
+	double FdpVelocidadeNavios(double x, RotaDirecao rota);
 };
 
 Experiment::Experiment() 
@@ -95,7 +118,11 @@ Experiment::Experiment()
 		m_rotaOesteNodeContainer(),
 		m_internetHelper(),
 		m_ultimoNavioRotaLesteY(-1.0),
-		m_ultimoNavioRotaOesteY(-1.0)
+		m_ultimoNavioRotaOesteY(-1.0),
+		m_variavelTempoEntreNaviosLeste(),
+		m_variavelVelocidadeNaviosLeste(),
+		m_variavelTempoEntreNaviosOeste(),
+		m_variavelVelocidadeNaviosOeste()
 {
 	m_ipv4AdressHelper.SetBase("10.1.0.0", "255.255.0.0");
 }
@@ -147,6 +174,7 @@ void Experiment::ConfigurarSimulacao()
 	ConfigurarLog();
 	ConfigurarInternetStack();
 	ConfigurarEstacaoTerrestre();
+	ConfigurarDistribuicoes();
 }
 
 void Experiment::ConfigurarLog()
@@ -157,6 +185,7 @@ void Experiment::ConfigurarLog()
 
 void Experiment::ConfigurarEstacaoTerrestre()
 {
+	NS_LOG_INFO("Configurando estacao terrestre");
 	m_estacaoTeNoderrestreNodeContainer.Create(1);
 
 	WimaxHelper wimaxHelper;
@@ -187,6 +216,7 @@ void Experiment::ConfigurarEstacaoTerrestre()
 
 	// Instala o internet stack
 	m_internetHelper.Install(m_estacaoTeNoderrestreNodeContainer);
+	NS_LOG_INFO("Estacao terrestre configurada");
 }
 
 void Experiment::ConfigurarInternetStack()
@@ -213,6 +243,7 @@ void Experiment::ConfigurarInternetStack()
 
 void Experiment::InserirNavioNaRota(RotaDirecao rota, double velocidade)
 {
+	NS_LOG_INFO("Inserindo navio na rota " << (rota == RotaDirecao::LESTE) ? "Leste" : "Oeste");
 	NodeContainer container;
 	container.Create(1);
 
@@ -262,6 +293,7 @@ void Experiment::InserirNavioNaRota(RotaDirecao rota, double velocidade)
 	{
 		m_rotaOesteNodeContainer.Add(container);
 	}
+	NS_LOG_INFO("Navio inserido");
 }
 
 double Experiment::CalculaYNovoNavio(RotaDirecao rota)
@@ -312,6 +344,10 @@ double Experiment::CalculaYNovoNavio(RotaDirecao rota)
 		}
 		m_ultimoNavioRotaOesteY = y;
 	}
+	std::stringstream logM;
+	logM << "Y do novo navio na rota " << (rota == RotaDirecao::LESTE) ? "Leste" : "Oeste";
+	logM << ": " << y;
+	NS_LOG_INFO(logM.str());
 	return y;
 }
 
@@ -320,6 +356,50 @@ Ptr<WimaxChannel> Experiment::CriaWimaxChannel()
 	Ptr<SimpleOfdmWimaxChannel> wimaxChannel = CreateObject<SimpleOfdmWimaxChannel>();
 	wimaxChannel->SetPropagationModel(SimpleOfdmWimaxChannel::FRIIS_PROPAGATION);
 	return wimaxChannel;
+}
+
+void Experiment::ConfigurarDistribuicoes()
+{
+	ConfigurarVariavelTempoNavios();
+	ConfigurarVariavelVelocidadeNavios();
+}
+
+void Experiment::ConfigurarVariavelTempoNavios()
+{
+	NS_LOG_INFO("Configurando variaveis aleatorias do intervalo entre navios");
+	for (double i = 0.0; i <= m_tempoSimulacao/2.0; i += 0.1)
+	{
+		m_variavelTempoEntreNaviosLeste.CDF(i, FdpTempoNavios(i, RotaDirecao::LESTE));
+		m_variavelTempoEntreNaviosOeste.CDF(i, FdpTempoNavios(i, RotaDirecao::OESTE));
+	}
+	NS_LOG_INFO("Variaveis configuradas");
+}
+
+void Experiment::ConfigurarVariavelVelocidadeNavios()
+{
+	NS_LOG_INFO("Configurando variaveis aleatorias da velocidade dos navios");
+	for (double i = 0.0; i <= VELOCIDADE_MAX_NAVIO; i += 0.01)
+	{
+		m_variavelVelocidadeNaviosLeste.CDF(i, FdpVelocidadeNavios(i, RotaDirecao::LESTE));
+		m_variavelVelocidadeNaviosOeste.CDF(i, FdpVelocidadeNavios(i, RotaDirecao::OESTE));
+	}
+	NS_LOG_INFO("Variaveis configuradas");
+}
+
+double Experiment::FdpTempoNavios(double x, RotaDirecao rota)
+{
+	double a = (rota == RotaDirecao::LESTE) ? FDP_A_ROTA_LESTE : FDP_A_ROTA_OESTE;
+	double b = (rota == RotaDirecao::LESTE) ? FDP_B_ROTA_LESTE : FDP_B_ROTA_OESTE;
+	return a * pow(b, x);
+}
+
+double Experiment::FdpVelocidadeNavios(double x, RotaDirecao rota)
+{
+	if (x <= 0) return 0.0;
+	double c = (rota == RotaDirecao::LESTE) ? FDP_C_ROTA_LESTE : FDP_C_ROTA_OESTE;
+	double mu = (rota == RotaDirecao::LESTE) ? FDP_MU_ROTA_LESTE : FDP_MU_ROTA_OESTE;
+	double sigma = (rota == RotaDirecao::LESTE) ? FDP_SIGMA_ROTA_LESTE : FDP_SIGMA_ROTA_OESTE;
+	return ( c / sqrt(2 * MATH_PI * pow(sigma, 2)) ) * exp( (-1) * pow((x-mu), 2) / (2 * pow(sigma, 2)) );
 }
 
 int main(int argc, char** argv)
