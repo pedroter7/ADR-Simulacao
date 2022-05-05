@@ -25,8 +25,24 @@
 #include <ns3/ipv4-list-routing-helper.h>
 #include <ns3/vector.h>
 #include <ns3/random-variable-stream.h>
+#include <ns3/mobility-model.h>
+#include <ns3/flow-monitor.h>
+#include <ns3/flow-monitor-helper.h>
+#include <ns3/nstime.h>
+#include <ns3/internet-stack-helper.h>
+#include <utility>
 #include <cmath>
 #include <numbers>
+#include <mutex>
+#include <fstream>
+#include <vector>
+#include <algorithm>
+
+#ifdef _WIN32 || _WIN64 || __CYGWIN__
+	#define PATH_SEPARATOR "\"
+#else
+	#define PATH_SEPARATOR "/"
+#endif
 
 #define EXPERIMENT_NAME "Experimento_ADR"
 #define PROTOCOLO_AODV 1
@@ -38,6 +54,8 @@
 #define DEFAULT_DISTANCIA_MINIMA_ENTRE_NAVIOS 5.0 // km
 #define DEFAULT_COMPRIMENTO_ROTA 60.0 // km
 #define UDP_SERVER_PORT 300
+#define MAX_PACOTES_HORA 450000000
+#define PACKET_SIZE 1024
 // Constantes das funcoes densidade de probabilidade
 #define FDP_A_ROTA_OESTE 0.292064
 #define FDP_B_ROTA_OESTE 0.998286
@@ -51,6 +69,9 @@
 #define FDP_SIGMA_ROTA_LESTE 5.189037
 #define MATH_PI 3.141592
 #define VELOCIDADE_MAX_NAVIO 27.6874 // km por segundo de simulacao
+// Constantes para converter 1 segundo simulacao = 1 hora
+#define FRACAO_SIMULACAO_MINUTO 0.016
+#define FRACAO_SIMULACAO_SEGUNDO 0.00028
 
 using namespace ns3;
 
@@ -59,6 +80,22 @@ enum RotaDirecao
 	LESTE,
 	OESTE
 };
+
+typedef struct MetricasColetadas
+{
+	double segundosSimulacao;
+	uint32_t naviosNasRotas;
+	double throughput;
+	double endToEndDelay;
+} MetricasColetadas;
+
+typedef struct ComparaCdfs
+{
+	bool operator() (const std::pair<double, double> & a, const std::pair<double, double> & b)
+	{
+		return a.second < b.second;
+	}
+} ComparaCdfs;
 
 NS_LOG_COMPONENT_DEFINE(EXPERIMENT_NAME);
 
@@ -69,9 +106,12 @@ public:
 	void CommandSetup(int argc, char **argv);
 	void Run();
 private:
+	std::mutex m_mutex;
 	uint32_t m_protocolo;
 	std::string m_nomeProtocolo;
 	std::string m_outDir;
+	std::string m_caminhoArquivoResultados;
+	std::ofstream m_streamArquivoResultados;
 	double m_distanciaEstacaoTerrestre;
 	double m_larguraRotas;
 	double m_comprimentoRota;
@@ -90,11 +130,14 @@ private:
 	// Controle para nao inserir um navio em cima de outro
 	double m_ultimoNavioRotaLesteY;
 	double m_ultimoNavioRotaOesteY;
+	// Metricas
+	uint32_t m_totalNaviosNaRota;
+	Ptr<FlowMonitor> m_flowMonitor;
 
 	void ConfigurarSimulacao();
 	void SetNomeProtocolo();
 	void ConfigurarEstacaoTerrestre();
-	void ConfigurarInternetStack();
+	void ConfigurarRoteamento();
 	void ConfigurarLog();
 	void InserirNavioNaRota(RotaDirecao rota, double velocidade);
 	Ptr<WimaxChannel> CriaWimaxChannel();
@@ -102,8 +145,17 @@ private:
 	void ConfigurarDistribuicoes();
 	void ConfigurarVariavelTempoNavios();
 	void ConfigurarVariavelVelocidadeNavios();
+	void ConfigurarMetricas();
 	double FdpTempoNavios(double x, RotaDirecao rota);
 	double FdpVelocidadeNavios(double x, RotaDirecao rota);
+	void IniciarRotinas();
+	void RotinaInstanciarNavioRotaLeste();
+	void RotinaInstanciarNavioRotaOeste();
+	void RotinaColetaDeMetricas();
+	// Arquivo de resultados
+	void SetCaminhoArquivoResultados();
+	void EscreverHeaders();
+	void EscreverMetricasColetadas(MetricasColetadas metricas);
 };
 
 Experiment::Experiment() 
@@ -122,9 +174,21 @@ Experiment::Experiment()
 		m_variavelTempoEntreNaviosLeste(),
 		m_variavelVelocidadeNaviosLeste(),
 		m_variavelTempoEntreNaviosOeste(),
-		m_variavelVelocidadeNaviosOeste()
+		m_variavelVelocidadeNaviosOeste(),
+		m_totalNaviosNaRota(0),
+		m_streamArquivoResultados()
 {
 	m_ipv4AdressHelper.SetBase("10.1.0.0", "255.255.0.0");
+}
+
+void Experiment::SetCaminhoArquivoResultados()
+{
+	std::stringstream st;
+	st << m_outDir << PATH_SEPARATOR
+		<< "ResultadoSimulacao_"
+		<< m_nomeProtocolo << "_MeshNetwork.csv";
+
+	m_caminhoArquivoResultados = st.str();
 }
 
 void Experiment::CommandSetup(int argc, char **argv)
@@ -140,16 +204,50 @@ void Experiment::CommandSetup(int argc, char **argv)
 	cmd.Parse(argc, argv);
 }
 
+void Experiment::EscreverHeaders()
+{
+	if (m_streamArquivoResultados.is_open()) m_streamArquivoResultados.close();
+
+	m_streamArquivoResultados.open(m_caminhoArquivoResultados);
+	
+	m_streamArquivoResultados << "SimulationSecond,"
+								<< "NodesNumber,"
+								<< "Throughput(bytes/s),"
+								<< "EndToEndDelay(s),"
+								<< "Protocol"
+								<< std::endl;
+
+	m_streamArquivoResultados.close();
+}
+
+void Experiment::EscreverMetricasColetadas(MetricasColetadas metricas)
+{
+	if (!m_streamArquivoResultados.is_open()) 
+		m_streamArquivoResultados.open(m_caminhoArquivoResultados, std::ios::app);
+
+	m_streamArquivoResultados << metricas.segundosSimulacao
+								<< ","
+								<< metricas.naviosNasRotas
+								<< ","
+								<< metricas.throughput
+								<< ","
+								<< metricas.endToEndDelay
+								<< ","
+								<< m_nomeProtocolo
+								<< std::endl;
+}
+
 void Experiment::Run()
 {
 	ConfigurarSimulacao();
-	// TODO iniciar simulacao
-	// TODO rotina para instanciar navios nas rotas
-	// TODO rotina para deletar nodes de navios que sairam da rota
-	// TODO rotina para coletar dados da simulacao
-	// TODO Parar simulacao
-	// TODO Escrever resultados
-	// TODO Limpar memoria	
+	IniciarRotinas();
+	NS_LOG_INFO("Iniciando simulacao");
+	Simulator::Stop(Seconds(m_tempoSimulacao));
+	Simulator::Run();
+
+	// Clear
+	m_streamArquivoResultados.close();
+	Simulator::Destroy();
 }
 
 void Experiment::SetNomeProtocolo()
@@ -172,9 +270,11 @@ void Experiment::SetNomeProtocolo()
 void Experiment::ConfigurarSimulacao()
 {
 	ConfigurarLog();
-	ConfigurarInternetStack();
+	ConfigurarRoteamento();
 	ConfigurarEstacaoTerrestre();
 	ConfigurarDistribuicoes();
+	SetCaminhoArquivoResultados();
+	EscreverHeaders();
 }
 
 void Experiment::ConfigurarLog()
@@ -196,7 +296,10 @@ void Experiment::ConfigurarEstacaoTerrestre()
 											CriaWimaxChannel(),
 											WimaxHelper::SCHED_TYPE_SIMPLE);
 	wimaxHelper.EnableAscii("land-station", m_estacaoTeNoderrestreNodeContainer);
-	
+
+	// Instala o internet stack
+	m_internetHelper.Install(m_estacaoTeNoderrestreNodeContainer);
+
 	m_ipInterfaceContainerEstacaoTerrestre = m_ipv4AdressHelper.Assign(netDevContainer);
 
 	// Posiciona a estacao 
@@ -214,12 +317,10 @@ void Experiment::ConfigurarEstacaoTerrestre()
 	estacaoApplicationContainer.Start(Seconds(1));
 	estacaoApplicationContainer.Stop(Seconds(m_tempoSimulacao + 1.0));
 
-	// Instala o internet stack
-	m_internetHelper.Install(m_estacaoTeNoderrestreNodeContainer);
 	NS_LOG_INFO("Estacao terrestre configurada");
 }
 
-void Experiment::ConfigurarInternetStack()
+void Experiment::ConfigurarRoteamento()
 {
 	Ipv4ListRoutingHelper routingHelper;
 	AodvHelper aodvHelper;
@@ -243,7 +344,10 @@ void Experiment::ConfigurarInternetStack()
 
 void Experiment::InserirNavioNaRota(RotaDirecao rota, double velocidade)
 {
-	NS_LOG_INFO("Inserindo navio na rota " << (rota == RotaDirecao::LESTE) ? "Leste" : "Oeste");
+	std::stringstream s;
+	s << "Inserindo navio na rota ";
+	s << (rota == RotaDirecao::LESTE) ? "Leste" : "Oeste";
+	NS_LOG_INFO(s.str());
 	NodeContainer container;
 	container.Create(1);
 
@@ -259,7 +363,10 @@ void Experiment::InserirNavioNaRota(RotaDirecao rota, double velocidade)
 	std::stringstream strStream;
 	strStream << "navio" << container.Get(0)->GetId();
 	wimaxHelper.EnableAscii(strStream.str(), container);
-	
+
+	// Instala o internet stack
+	m_internetHelper.Install(container);
+
 	m_ipv4AdressHelper.Assign(netDevContainer);
 
 	// Posiciona o navio
@@ -275,15 +382,16 @@ void Experiment::InserirNavioNaRota(RotaDirecao rota, double velocidade)
 
 	// Configura a aplicacao cliente udp
 	UdpClientHelper clientHelper(m_ipInterfaceContainerEstacaoTerrestre.GetAddress(0), UDP_SERVER_PORT);
-	clientHelper.SetAttribute("MaxPackets", UintegerValue(1500)); // TODO randomizar ?
-	clientHelper.SetAttribute("Interval", TimeValue(Seconds(0.5))); // TODO randomizar ?
-	clientHelper.SetAttribute("PacketSize", UintegerValue(1024)); // TODO randomizar ?
+	clientHelper.SetAttribute("MaxPackets", UintegerValue(MAX_PACOTES_HORA));
+	// Randomiza intervalo entre o envio de pacotes
+	UniformRandomVariable uRandVar;
+	double intervaloMinimo = FRACAO_SIMULACAO_SEGUNDO/10;
+	double intervaloMaximo = FRACAO_SIMULACAO_SEGUNDO*2;
+	clientHelper.SetAttribute("Interval", TimeValue(Seconds(uRandVar.GetValue(intervaloMinimo, intervaloMaximo)))); 
+	clientHelper.SetAttribute("PacketSize", UintegerValue(PACKET_SIZE));
 	ApplicationContainer applicationContainer = clientHelper.Install(container);
 	applicationContainer.Start(Seconds(1));
 	applicationContainer.Stop(Seconds(m_tempoSimulacao));
-
-	// Instala o internet stack
-	m_internetHelper.Install(container);
 
 	if (rota == RotaDirecao::LESTE)
 	{
@@ -293,7 +401,14 @@ void Experiment::InserirNavioNaRota(RotaDirecao rota, double velocidade)
 	{
 		m_rotaOesteNodeContainer.Add(container);
 	}
+
 	NS_LOG_INFO("Navio inserido");
+
+	// Atualiza o numero de navios na rota
+	m_mutex.lock();
+	m_totalNaviosNaRota++;
+	m_mutex.unlock();
+	
 }
 
 double Experiment::CalculaYNovoNavio(RotaDirecao rota)
@@ -366,22 +481,48 @@ void Experiment::ConfigurarDistribuicoes()
 
 void Experiment::ConfigurarVariavelTempoNavios()
 {
+	// TODO metodo CDF deve receber um valor e a probabilidade de o valor ser menor que ele
 	NS_LOG_INFO("Configurando variaveis aleatorias do intervalo entre navios");
-	for (double i = 0.0; i <= m_tempoSimulacao/2.0; i += 0.1)
+	std::vector<std::pair<double, double>> cdfsLeste, cdfsOeste;
+	for (double i = 1.0; i <= m_tempoSimulacao/5.0; i += 0.1)
 	{
-		m_variavelTempoEntreNaviosLeste.CDF(i, FdpTempoNavios(i, RotaDirecao::LESTE));
-		m_variavelTempoEntreNaviosOeste.CDF(i, FdpTempoNavios(i, RotaDirecao::OESTE));
+		cdfsLeste.push_back(std::pair<double, double>(i, FdpTempoNavios(i, RotaDirecao::LESTE)));
+		cdfsOeste.push_back(std::pair<double, double>(i, FdpTempoNavios(i, RotaDirecao::OESTE)));
+	}
+	std::sort(cdfsLeste.begin(), cdfsLeste.end(), ComparaCdfs());
+	std::sort(cdfsOeste.begin(), cdfsOeste.end(), ComparaCdfs());
+
+	for (auto p : cdfsLeste)
+	{
+		m_variavelTempoEntreNaviosLeste.CDF(p.first, p.second);
+	}
+	for (auto p : cdfsOeste)
+	{
+		m_variavelTempoEntreNaviosLeste.CDF(p.first, p.second);
 	}
 	NS_LOG_INFO("Variaveis configuradas");
 }
 
 void Experiment::ConfigurarVariavelVelocidadeNavios()
 {
+	// TODO metodo CDF deve receber um valor e a probabilidade de o valor ser menor que ele
 	NS_LOG_INFO("Configurando variaveis aleatorias da velocidade dos navios");
-	for (double i = 0.0; i <= VELOCIDADE_MAX_NAVIO; i += 0.01)
+	std::vector<std::pair<double, double>> cdfsLeste, cdfsOeste;
+	for (double i = 1.0; i <= VELOCIDADE_MAX_NAVIO; i += 1.0)
 	{
-		m_variavelVelocidadeNaviosLeste.CDF(i, FdpVelocidadeNavios(i, RotaDirecao::LESTE));
-		m_variavelVelocidadeNaviosOeste.CDF(i, FdpVelocidadeNavios(i, RotaDirecao::OESTE));
+		cdfsLeste.push_back(std::pair<double, double>(i, FdpVelocidadeNavios(i, RotaDirecao::LESTE)));
+		cdfsOeste.push_back(std::pair<double, double>(i, FdpVelocidadeNavios(i, RotaDirecao::OESTE)));
+	}
+	std::sort(cdfsLeste.begin(), cdfsLeste.end(), ComparaCdfs());
+	std::sort(cdfsOeste.begin(), cdfsOeste.end(), ComparaCdfs());
+
+	for (auto p : cdfsLeste)
+	{
+		m_variavelVelocidadeNaviosLeste.CDF(p.first, p.second);
+	}
+	for (auto p : cdfsOeste)
+	{
+		m_variavelVelocidadeNaviosOeste.CDF(p.first, p.second);
 	}
 	NS_LOG_INFO("Variaveis configuradas");
 }
@@ -400,6 +541,80 @@ double Experiment::FdpVelocidadeNavios(double x, RotaDirecao rota)
 	double mu = (rota == RotaDirecao::LESTE) ? FDP_MU_ROTA_LESTE : FDP_MU_ROTA_OESTE;
 	double sigma = (rota == RotaDirecao::LESTE) ? FDP_SIGMA_ROTA_LESTE : FDP_SIGMA_ROTA_OESTE;
 	return ( c / sqrt(2 * MATH_PI * pow(sigma, 2)) ) * exp( (-1) * pow((x-mu), 2) / (2 * pow(sigma, 2)) );
+}
+
+void Experiment::RotinaInstanciarNavioRotaLeste()
+{
+	double v = m_variavelVelocidadeNaviosLeste.GetValue();
+	InserirNavioNaRota(RotaDirecao::LESTE, v);
+	double intervaloProximoNavio = m_variavelTempoEntreNaviosLeste.GetValue();
+	Simulator::Schedule(Seconds(intervaloProximoNavio*FRACAO_SIMULACAO_MINUTO), &Experiment::RotinaInstanciarNavioRotaLeste, this);
+}
+
+void Experiment::RotinaInstanciarNavioRotaOeste()
+{
+	double v = m_variavelVelocidadeNaviosOeste.GetValue();
+	InserirNavioNaRota(RotaDirecao::OESTE, v);
+	double intervaloProximoNavio = m_variavelTempoEntreNaviosOeste.GetValue();
+	Simulator::Schedule(Seconds(intervaloProximoNavio*FRACAO_SIMULACAO_MINUTO), &Experiment::RotinaInstanciarNavioRotaOeste, this);
+}
+
+void Experiment::RotinaColetaDeMetricas()
+{
+	NS_LOG_INFO("Coletando metricas");
+	MetricasColetadas metricas;
+	m_mutex.lock();
+	metricas.naviosNasRotas = m_totalNaviosNaRota;
+	m_mutex.unlock();
+	metricas.segundosSimulacao = Simulator::Now().GetSeconds();
+	
+	// Calcula throughput e end-to-end delay
+	auto flowStats = m_flowMonitor->GetFlowStats();
+	int128_t sDelay = 0;
+	uint64_t nDelay = 0;
+	uint128_t sBytes = 0;
+	uint64_t nBytes = 0;
+	for (auto i = flowStats.begin(); i != flowStats.end(); ++i)
+	{
+		auto stats = (*i).second;
+		sDelay += stats.delaySum.ToInteger(Time::Unit::S);
+		sBytes += stats.txBytes;
+		nBytes++;
+		nDelay++;
+	}
+	if (nDelay > 0) metricas.endToEndDelay = ((double) sDelay/nDelay)*FRACAO_SIMULACAO_SEGUNDO;
+	else metricas.endToEndDelay = 0;
+
+	if (nBytes > 0) metricas.throughput = ((double) sBytes/nBytes)*FRACAO_SIMULACAO_SEGUNDO;
+	else metricas.throughput = 0;
+
+	EscreverMetricasColetadas(metricas);
+
+	Simulator::Schedule(Seconds(1.0), &Experiment::RotinaColetaDeMetricas, this);
+
+	NS_LOG_INFO("Metricas coletadas: navios("
+					<<metricas.naviosNasRotas
+					<<"); delay("
+					<<metricas.endToEndDelay
+					<<"); simulationSeconds("
+					<<metricas.segundosSimulacao
+					<<");");
+}
+
+void Experiment::IniciarRotinas()
+{
+	NS_LOG_INFO("Iniciando rotinas");
+	RotinaInstanciarNavioRotaLeste();
+	RotinaInstanciarNavioRotaOeste();
+	RotinaColetaDeMetricas();
+}
+
+void Experiment::ConfigurarMetricas()
+{
+	// FlowMonitor
+	NS_LOG_INFO("Configurando FlowMonitor");
+	FlowMonitorHelper monitorHelper;
+	m_flowMonitor = monitorHelper.InstallAll();
 }
 
 int main(int argc, char** argv)
